@@ -1,52 +1,117 @@
+/*  
+	The MIT License (MIT)
+
+	Copyright (c) 2015 svddevelop
+
+	Permission is hereby granted, free of charge, to any person obtaining a copy
+	of this software and associated documentation files (the "Software"), to deal
+	in the Software without restriction, including without limitation the rights
+	to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+	copies of the Software, and to permit persons to whom the Software is
+	furnished to do so, subject to the following conditions:
+
+	The above copyright notice and this permission notice shall be included in all
+	copies or substantial portions of the Software.
+
+	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+	AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+	SOFTWARE.
+*/
 #include <avr/io.h>
 #include <avr/iom8.h>
 #include <avr/interrupt.h>
+#include <avr/eeprom.h>
 
-#define _SERVO_CNT	2
-
-//typedef unsigned char uint8_t;
-//#define uint8_t unsigned char
-
+#define _SERVO_CNT	8
 
 /*
-Minimal angle is 0°. They need to send one impulse an 0.388 ms.
-Maximal angle is 180°. Impulse must to be 2.140 ms.
-It is means that timer must to be call every(2.140-0.388)/180=0,009733 ms.
-or better to set for every 4°: 0,009733 * 4 = 0.0389 ms= 25707Hz
+	Library tested with ATMEGA8 with internal oscilation to 8MHz.
+	For each other frequence need to reclac and to rewrite the
+	values in the eememSet.
 
-At every 20 ms can to call 20/0.0389=514
+	By eememSet items have values for OCR1A-register for 16-bit Timer1.
+	An 8MHz one tick in OCR1A costs 1 microsecond.
 
-Prescaler PSC=F_CPU/25707 = 311 
-
+   In the EEPROM saved information for each connected motor (from datasheet):
+       timeimpulse for minimal ticks for minimal angle ;
+       timeimpulse for maximal tichs for angle.   
 */
-
-#define _T_CALLER	(F_CPU/256)
-
-#define _RESET_TICK	(514-1)
-
-volatile uint16_t counter = 0; //ticks counter. every _RESET_TICK must to be to 0 reseted. 
 
 typedef struct {
 	uint8_t received:1;
 } opt_t;
 
+//namespace servo_const {
+  typedef struct {
+	uint16_t cntmin;
+	uint16_t cntmax;
+  } servo_set_t;
+  
+//}
+
+
+
 typedef struct {
-	uint8_t idx;		//pin number
-	uint8_t angle; 		//from 0 <-> 180
-	int8_t process; 	//how meny tacts to do (one decrement from angle)
+	uint8_t idx;		//pin number maske
+	uint16_t counter;	//timer counter
+	int8_t	angle;		//values for recalculation of counter. from -90 to +90 only.
 } servo_t;
 
-#define _SET_PROC(x)	x.process=x.angle
 
+static servo_set_t EEMEM eememSet[_SERVO_CNT]={
+		 {780, 2200}
+		,{780, 2200}
+		,{780, 2200}
+		,{780, 2200}
+		,{780, 2200}
+		,{780, 2200}
+		,{780, 2200}
+		,{780, 2200}
+		};
+ //for Patrics entity (HS-300BB) is 0.89mS -||- 2.2mS
+
+static servo_set_t tmpSet;
 static servo_t servos[_SERVO_CNT];
 static opt_t opt;
 static 	char ch;
+static uint8_t idx = 0;
+static uint8_t port = 0;
 
+
+#define _START_TCI	TIMSK |= (1 << OCIE1A)
+#define _STOP_TCI	TIMSK &= ~(1 << OCIE1A)
 
 void uart_putc( char c )
 {
   while( ( UCSRA & ( 1 << UDRE ) ) == 0  );
   UDR = c;
+}
+
+static uint16_t angle2counter(uint8_t idx, int8_t angle){
+  
+	uint16_t addr = &eememSet;
+	addr += sizeof(servo_set_t)*idx;
+	eeprom_read_block ((void *)&tmpSet, addr, sizeof(servo_set_t));
+	return (tmpSet.cntmin + tmpSet.cntmax)/2 + angle*((tmpSet.cntmax - tmpSet.cntmin)/180);
+}
+
+
+void timerStart(){
+
+	_STOP_TCI;
+	port &= ~(servos[idx++].idx);
+	if (idx >= _SERVO_CNT) idx = 0;
+	port |= (servos[idx].idx);
+
+	OCR1A = servos[idx].counter;
+	
+	TCNT1 = 0;	
+	PORTB = port;
+	_START_TCI;
 }
 
 int main(void) {
@@ -68,34 +133,49 @@ int main(void) {
 
 	uart_putc('>');
 	//Init timer
-	//http://mainloop.ru/avr-atmega/avr-timer-counter.html
-  	TCCR1B = (0<<CS12)|(0<<CS11)|(1<<CS10); // 
-	//#define _T_OFFSET	(_T_CALLER/25707)
-	#define _T_OFFSET  0x0;
-  	TIMSK |= (1<<TOIE1); // 
-  	TCNT1 = _T_OFFSET;        // offset of counter
-	
-	//*
+	//OCR1A = 0x0028;  //0x0028 - 40uS
+
+	OCR1A = 0x7d0;  //0x030C - 780uS
+
+	//Achtung! Diese reinfolge ist wichtigste!
+	//OCR1AL = 0x20;
+	//OCR1AH = 0x4e;
+
+	//OCR1AL = 0x0A;
+	//OCR1AH = 0x00;
+	//***
+
+
+
+	TCCR1A = 0;
+	TCNT1 = 0;
+	TCCR1B |= (1 << WGM12);
+	TCCR1B |= (1<<CS11);
+
+	idx = 0;
+
+
+
+	//----------------------
 
 	//INIT
 	DDRB = 0xFF;
 	DDRC = 0xFF;
-	servos[0].idx = (1 << PB0);
-	servos[0].angle = 9;
-	servos[0].process = 9;
+	for(idx =0; idx < _SERVO_CNT; idx++){
+		int16_t addr = &eememSet;
+		addr += sizeof(servo_set_t)*idx;
+		eeprom_read_block ((void *)&tmpSet, addr, sizeof(servo_set_t));
+		servos[idx].idx = (1 << (idx));
+		servos[idx].counter = tmpSet.cntmin;
+		servos[idx].angle = -90;
+	}
+	idx = 0;
 
-	servos[1].idx = (1 << PB1);
-	servos[1].angle = 12;
-	servos[1].process = 12;
-	//*
-
-
-
-  	sei();                // ?????????? ??? ?????? ?????????? ??????????
-
-
-
+	timerStart();
+  	sei();     
 	opt.received = 0;
+	uint8_t bidx;
+	int8_t angle;
 
 	while(1){
 
@@ -107,66 +187,44 @@ int main(void) {
 
 		if (opt.received == 1){
 
-			if (ch == '+')
-				servos[0].angle += 10;
-			if (ch == '-')
-				servos[0].angle -= 10;
-			uart_putc(ch);
-			uart_putc(13);
-			uart_putc(10);
+			if ((ch >= '1') & (ch <= '8')){
+				bidx = ch - '1';
+				//uart_putc(ch);
+			}
+			if ((ch == '+')|(ch == '-')){
+
+				if (ch == '+'){
+
+					angle = servos[bidx].angle;
+					angle += 15;
+					if (angle > +90) angle = +90;
+				}
+				if (ch == '-'){
+
+					angle = servos[bidx].angle;
+					angle -= 15;
+					if (angle < -90) angle = -90;
+				}
+				servos[bidx].counter = angle2counter(bidx, angle);
+				servos[bidx].angle = angle;
+				//uart_putc(ch);
+				uart_putc(13);
+				uart_putc(10);
+				uart_putc('>');
+			}
 			opt.received = 0;
 		}
 	
 	}
 }
 
-static uint8_t port = 0;
 
-ISR( TIMER1_OVF_vect )
+
+ISR(TIMER1_COMPA_vect)
 {
-	PORTC = 1 & counter;
-	TCNT1 = _T_OFFSET;// offset for correctiong of ours frequence
-	
-	counter++;
-	uint8_t i;//, port = 0;
-	/*if (counter >= _RESET_TICK){
-
-		//Reinnitialisation
-		for(i=0; i<_SERVO_CNT; i++){
-			_SET_PROC(servos[i]);
-		}
-		counter = 0;
-		//*
-
-	}
-	else {
-		port = 0;
-		for(i=0; i<_SERVO_CNT; i++){
-			if (servos[i].process > 0){
-
-				servos[i].process--;
-				port |= servos[i].idx;
-			}
-		}
-	}*/
-
-	// Variant 2:
-	port = 0;
-	for(i=0; i<_SERVO_CNT; i++){
-		if (servos[i].process > -servos[i].angle){
-
-			servos[i].process--;
-			if (servos[i].process >= 0)
-				port |= servos[i].idx;
-		}else{
-
-			servos[i].process = servos[i].angle;
-			//port |= servos[i].idx;
-		}
-	}
-	//
-
-
+	timerStart();
+	PORTC = 1 & idx;
 	PORTB = port;
-	PORTC = 1 & counter;
 }
+
+
